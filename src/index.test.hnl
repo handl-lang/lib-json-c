@@ -1,0 +1,123 @@
+--- json-c contract tests — mirror `lib-json-js`'s suite (itself a
+--- mirror of `lib-json`'s `src/json.test.hnl`), plus the json-c
+--- specifics: strict RFC 8259 parsing (gated on `jsonc_available`),
+--- int64/double number split, length-prefixed string escaping, and
+--- the codec token.
+---
+--- When `libjson-c` is absent the exports delegate to the `json`
+--- reference module: value-level cases still hold (same contract),
+--- but strictness assertions are gated on `m.jsonc_available`.
+---
+--- NOTE on literals: hnl string escapes are sequential global
+--- replaces (`\n`,`\r`,`\t`,`\"`,`\\` in that order), so `"\\n"`
+--- yields backslash+LF, NOT backslash+n. JSON escape sequences in
+--- test inputs are therefore built by concatenation: `bsl` is one
+--- backslash, `jnl`/`jtb`/`jrt` the two-char JSON escapes.
+
+from "./index" import * as m
+
+res_tag :: r ~> match r { ok(_): "ok", err(_): "err", _: "?" }
+
+bsl := "\\"
+jnl := bsl + "n"
+jtb := bsl + "t"
+jrt := bsl + "r"
+
+-- diagnostics -------------------------------------------------------------------
+
+test_avail_bool :: assert(m.jsonc_available == true || m.jsonc_available == false) = true
+
+test_version_nonneg :: assert(m.jsonc_version >= 0) = true
+
+-- codec token ---------------------------------------------------------------------
+
+test_codec_type :: assert m.json().type = "codec"
+
+test_codec_name :: assert m.json().name = "json"
+
+-- stringify ------------------------------------------------------------------------
+
+test_s_null :: assert m.stringify(null) = "null"
+test_s_num :: assert m.stringify(42) = "42"
+test_s_num_frac :: assert m.stringify(1.5) = "1.5"
+test_s_num_neg :: assert m.stringify(-7) = "-7"
+test_s_bool :: assert m.stringify(true) = "true"
+test_s_false :: assert m.stringify(false) = "false"
+test_s_str :: assert m.stringify("hi") = "\"hi\""
+test_s_str_escape :: assert m.stringify("a\"b") = "\"a" + bsl + "\"b\""
+test_s_str_backslash :: assert m.stringify("a\\b") = "\"a" + bsl + bsl + "b\""
+test_s_str_newline :: assert m.stringify("a\nb") = "\"a" + jnl + "b\""
+test_s_str_tab :: assert m.stringify("a\tb") = "\"a" + jtb + "b\""
+test_s_str_cr :: assert m.stringify("a\rb") = "\"a" + jrt + "b\""
+test_s_unicode :: assert m.stringify("héllo") = "\"héllo\""
+test_s_arr :: assert m.stringify([1, 2]) = "[1,2]"
+test_s_obj :: assert m.stringify({ a: 1 }) = "{\"a\":1}"
+test_s_nested :: assert m.stringify({ a: [1, { b: null }], c: "x" }) = "{\"a\":[1,{\"b\":null}],\"c\":\"x\"}"
+test_s_empty_arr :: assert m.stringify([]) = "[]"
+test_s_empty_obj :: assert m.stringify({}) = "{}"
+test_s_nonfinite :: assert(if m.jsonc_available {
+  m.stringify(math.nan()) == "null"
+} else { true }) = true
+
+-- parse -----------------------------------------------------------------------------
+
+test_p_num :: assert m.parse("42") = 42
+test_p_num_frac :: assert m.parse("1.5") = 1.5
+test_p_num_neg :: assert m.parse("-3.25") = -3.25
+test_p_num_exp :: assert m.parse("1e3") = 1000
+test_p_str :: assert m.parse("\"hi\"") = "hi"
+test_p_str_escape :: assert m.parse("\"a" + jnl + "b\"") = "a\nb"
+test_p_str_tab_escape :: assert m.parse("\"a" + jtb + "b\"") = "a\tb"
+test_p_str_quote_escape :: assert m.parse("\"a" + bsl + "\"b\"") = "a\"b"
+test_p_str_backslash_escape :: assert m.parse("\"a" + bsl + bsl + "b\"") = "a\\b"
+test_p_str_unicode_escape :: assert m.parse("\"" + bsl + "u00e9\"") = "é"
+test_p_str_unicode_literal :: assert m.parse("\"héllo\"") = "héllo"
+test_p_str_surrogate_pair :: assert m.parse("\"" + bsl + "ud83d" + bsl + "ude00\"") = "😀"
+test_p_arr :: assert m.parse("[1,2]") = [1, 2]
+test_p_obj :: assert m.parse("{\"a\":1}") = { a: 1 }
+test_p_bool :: assert m.parse("true") = true
+test_p_false :: assert m.parse("false") = false
+test_p_null :: assert m.parse("null") = null
+test_p_nest :: assert m.parse("{\"a\":[1,{\"b\":null}]}") = { a: [1, { b: null }] }
+test_p_whitespace :: assert m.parse("  { \"a\" : [ 1 , 2 ] } \n") = { a: [1, 2] }
+test_p_scalar_top :: assert m.parse("\"just a string\"") = "just a string"
+test_p_deep :: assert m.parse("[[[{\"a\":[true,false,null]}]]]") = [[[{ a: [true, false, null] }]]]
+test_p_dup_key :: assert m.parse("{\"a\":1,\"a\":2}") = { a: 2 }
+
+-- round-trips ------------------------------------------------------------------------
+
+test_rt :: assert m.parse(m.stringify({ a: [1, 2], b: { c: "x" } })) = { a: [1, 2], b: { c: "x" } }
+test_rt_str :: assert m.parse(m.stringify("héllo wörld")) = "héllo wörld"
+test_rt_escapes :: assert m.parse(m.stringify("q\"uote\\slash\nnewline\té")) = "q\"uote\\slash\nnewline\té"
+test_rt_num :: assert m.parse(m.stringify(3.14159)) = 3.14159
+test_rt_int :: assert m.parse(m.stringify(9007199254740991)) = 9007199254740991
+
+-- strictness (json-c only; the fallback keeps lib-json's lenient parse) ----------------
+
+test_strict_trailing_comma :: assert(if m.jsonc_available {
+  res_tag(error.try((x) ~> m.parse("[1,2,]"))) == "err"
+} else { true }) = true
+
+test_strict_trailing_garbage :: assert(if m.jsonc_available {
+  res_tag(error.try((x) ~> m.parse("[1] 2"))) == "err"
+} else { true }) = true
+
+test_strict_unquoted_key :: assert(if m.jsonc_available {
+  res_tag(error.try((x) ~> m.parse("{a:1}"))) == "err"
+} else { true }) = true
+
+test_strict_single_quote :: assert(if m.jsonc_available {
+  res_tag(error.try((x) ~> m.parse("'hi'"))) == "err"
+} else { true }) = true
+
+test_strict_bad_escape :: assert(if m.jsonc_available {
+  res_tag(error.try((x) ~> m.parse("\"a" + bsl + "qb\""))) == "err"
+} else { true }) = true
+
+test_strict_empty :: assert(if m.jsonc_available {
+  res_tag(error.try((x) ~> m.parse(""))) == "err"
+} else { true }) = true
+
+test_strict_comment :: assert(if m.jsonc_available {
+  res_tag(error.try((x) ~> m.parse("[1, /* c */ 2]"))) == "err"
+} else { true }) = true

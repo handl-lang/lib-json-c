@@ -1,0 +1,3 @@
+-- lib-json-c: modules this package provides (entry defaults to
+-- src/index.hnl; N modules resolve to src/<name>/index.hnl).
+{ deps: { json: "branch:main" }, modules: ["json-c"], description: "C backend of the json contract — parse/serialize via libjson-c (json-c) through the C ffi; falls back to the pure-handl json module when libjson-c is absent.", license: "MIT" }

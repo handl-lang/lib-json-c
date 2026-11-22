@@ -1,0 +1,539 @@
+--- json-c -- the C backend for the `json` codec contract.
+---
+--- @details
+--- Both directions run through json-c (`libjson-c`, the reference C
+--- JSON library) via `ffi.call`, discovered by sonde name like the
+--- other `*-c` backends:
+---
+--- - `json.parse` -> `json_tokener_parse` (strict RFC 8259: malformed
+---   input or trailing garbage returns NULL -> `error.raise`; the
+---   contract has no `{err}` channel, matching `json-js`'s `throws`).
+---   The resulting `json_object` tree is walked iteratively: scalars
+---   through `json_object_get_{type,boolean,int64,double,string}`,
+---   arrays through `json_object_array_length`/`_get_idx`, objects
+---   through the `lh_table` linked list -- `json_object_get_object`
+---   plus `ffi.read` of the `lh_entry` `{k, v, next}` layout (`k`/`v`
+---   chased with `ffi.read(..., "cstr")` / recursion into `go` jobs).
+---   `json_object_put` releases the tree once the walk completes.
+--- - `json.stringify` -> an explicit job stack builds the
+---   `json_object` tree bottom-up in C (`json_object_new_*`,
+---   `json_object_object_add`, `json_object_array_add` -- child
+---   pointers are stolen, so no refcount bookkeeping), serializes
+---   with `json_object_to_json_string_ext(..., JSON_C_TO_STRING_PLAIN)`
+---   and `json_object_put`s the root. Integral numbers with
+---   `|v| < 2^53` marshal as `int64` (so `42` prints `42`, not
+---   `42.0`); everything else as `double`. Strings marshal
+---   length-prefixed (`json_object_new_string_len` over
+---   `bytes.utf8_encode`), so embedded NULs and non-ASCII round-trip.
+---
+--- Deliberate notes vs `lib-json` (reference) / `lib-json-handl` /
+--- `json-js`:
+--- - Strictness: json-c rejects trailing commas, comments, single
+---   quotes, unquoted keys, trailing garbage and bad escapes -- closer
+---   to `json-js`'s `JSON.parse` than to `lib-json-handl`'s lenient
+---   scanner.
+--- - Numbers: `int64`/`double` split preserves integer rendering;
+---   non-finite inputs (`NaN`, `±Infinity`) serialize as `null` per
+---   json-c's `JSON_C_TO_STRING_PLAIN` handling, matching `json-js`.
+--- - Escaping: json-c escapes all control characters, `"` and `\`;
+---   non-ASCII is emitted as literal UTF-8 (not `\uXXXX`).
+--- - Key order: json-c preserves insertion order, so `parse` ->
+---   `stringify` is order-faithful (unlike JS's integer-key sorting).
+--- - Duplicate keys: `object_add` replaces, last wins -- same as
+---   `obj.from_entries`.
+--- - Object keys containing a literal NUL cannot marshal (`cstr`
+---   descriptors are NUL-checked); every other string round-trips.
+---
+--- When `libjson-c` cannot be loaded the exports delegate to `json`
+--- (the pure-handl reference in lib-json) so the module stays usable;
+--- `jsonc_available`/`jsonc_version` report which path ran. Under the
+--- fallback, `parse` keeps the reference's lenient semantics -- gate
+--- strictness assertions on `jsonc_available`.
+---
+--- `ffi`, `type`, `math`, `error`, `result` resolve through the host
+--- module chain or explicit imports -- the `*-c` convention.
+
+from "result" import { ok, err }
+from "bytes" import * as bytes
+from "typeof" import * as typeof
+from "obj" import * as obj
+from "json" import * as jref
+
+-- library probe -----------------------------------------------------------------
+
+is_ok := (r) ~> match r { ok(_): true, _: false }
+
+try_load := (name) ~> if is_ok(ffi.load(name)) { name } else { null }
+
+--- First soname that loads: the versioned `.so.5`, then the `.so` link.
+pick_lib := while { c: ["libjson-c.so.5", "libjson-c.so"], found: null } {
+  (c, found) ~> match c {
+    []: { out: found },
+    [h, ...t]: { state: { c: t, found: if found == null { try_load(h) } else { found } } }
+  }
+}
+
+jlib := pick_lib
+
+--- json-c's release version as an int (0 when the library is absent).
+jc_ver := if jlib == null {
+  0
+} else {
+  ffi.call(jlib, "json_c_version_num", [], [], "i32", false)
+}
+
+-- list helpers --------------------------------------------------------------------
+
+list_len := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [_, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+l_rev := (xs) ~> while { xs: xs, acc: [] } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [h, ...t]: { state: { xs: t, acc: [h, ...acc] } }
+  }
+}
+
+drop := (xs, n) ~> while { xs: xs, n: n } {
+  (xs, n) ~> if n <= 0 {
+    { out: xs }
+  } else {
+    match xs {
+      []: { out: xs },
+      [_, ...t]: { state: { xs: t, n: n - 1 } }
+    }
+  }
+}
+
+at := (xs, i) ~> match drop(xs, i) {
+  [h, ..._]: h,
+  _: null
+}
+
+p_at := (p, i) ~> match p {
+  [a, b]: if i == 0 { a } else { b },
+  _: null
+}
+
+-- json-c ffi wrappers --------------------------------------------------------------
+
+--- Strict RFC 8259 parsing needs an explicit tokener: the bare
+--- `json_tokener_parse` is lenient by default (accepts trailing
+--- commas, single quotes, comments) and returns NULL both for
+--- malformed input AND for a top-level JSON `null`. The tokener
+--- lifecycle is new -> set_flags(JSON_TOKENER_STRICT=1) ->
+--- parse_ex(bytes,len) -> get_error/get_parse_end -> free.
+c_tok_new := () ~> ffi.call(jlib, "json_tokener_new", [], [], "ptr", false)
+
+c_tok_flags := (t, f) ~> ffi.call(jlib, "json_tokener_set_flags", [t, f], ["ptr", "i32"], "i32", false)
+
+c_parse_ex := (t, b, n) ~> ffi.call(jlib, "json_tokener_parse_ex", [t, b, n], ["ptr", "in_ptr", "i32"], "ptr", false)
+
+c_tok_err := (t) ~> ffi.call(jlib, "json_tokener_get_error", [t], ["ptr"], "i32", false)
+
+c_tok_end := (t) ~> ffi.call(jlib, "json_tokener_get_parse_end", [t], ["ptr"], "i64", false)
+
+c_tok_free := (t) ~> ffi.call(jlib, "json_tokener_free", [t], ["ptr"], "void", false)
+
+c_put := (o) ~> ffi.call(jlib, "json_object_put", [o], ["ptr"], "i32", false)
+
+c_type := (o) ~> ffi.call(jlib, "json_object_get_type", [o], ["ptr"], "i32", false)
+
+c_get_bool := (o) ~> ffi.call(jlib, "json_object_get_boolean", [o], ["ptr"], "i32", false)
+
+c_get_int := (o) ~> ffi.call(jlib, "json_object_get_int64", [o], ["ptr"], "i64", false)
+
+c_get_dbl := (o) ~> ffi.call(jlib, "json_object_get_double", [o], ["ptr"], "f64", false)
+
+c_get_str := (o) ~> ffi.call(jlib, "json_object_get_string", [o], ["ptr"], "cstr", false)
+
+c_arr_len := (o) ~> ffi.call(jlib, "json_object_array_length", [o], ["ptr"], "i32", false)
+
+c_arr_get := (o, i) ~> ffi.call(jlib, "json_object_array_get_idx", [o, i], ["ptr", "i32"], "ptr", false)
+
+c_obj_tbl := (o) ~> ffi.call(jlib, "json_object_get_object", [o], ["ptr"], "ptr", false)
+
+--- json-c represents JSON null as the NULL pointer itself
+--- (`json_type_null` is `obj == NULL`): `json_object_new_null()`
+--- returns NULL, `object_add`/`array_add`/`put`/`to_json_string_ext`
+--- all accept it, and `json_object_get_type(NULL)` reports null.
+--- So a null Value marshals as the address 0 -- no allocation needed.
+c_new_bool := (b) ~> ffi.call(jlib, "json_object_new_boolean", [b], ["i32"], "ptr", false)
+
+c_new_int := (n) ~> ffi.call(jlib, "json_object_new_int64", [n], ["i64"], "ptr", false)
+
+c_new_dbl := (n) ~> ffi.call(jlib, "json_object_new_double", [n], ["f64"], "ptr", false)
+
+--- Length-prefixed string: survives embedded NULs and arbitrary UTF-8.
+c_new_str := (s) ~> do {
+  b := bytes.utf8_encode(s)
+  ffi.call(jlib, "json_object_new_string_len", [b, bytes.len(b)], ["in_ptr", "i32"], "ptr", false)
+}
+
+c_new_arr := () ~> ffi.call(jlib, "json_object_new_array", [], [], "ptr", false)
+
+c_new_obj := () ~> ffi.call(jlib, "json_object_new_object", [], [], "ptr", false)
+
+c_arr_add := (a, v) ~> ffi.call(jlib, "json_object_array_add", [a, v], ["ptr", "ptr"], "i32", false)
+
+c_obj_add := (o, k, v) ~> ffi.call(jlib, "json_object_object_add", [o, k, v], ["ptr", "cstr", "ptr"], "i32", false)
+
+c_to_json := (o) ~> ffi.call(jlib, "json_object_to_json_string_ext", [o, 0], ["ptr", "i32"], "cstr", false)
+
+-- parse: json_object tree -> handl Value -----------------------------------------
+--
+-- The walk is an explicit job stack (no recursion). Jobs are uniform
+-- records {k, o, x, d, key}:
+--   {k:"go",    o}              -- convert C object `o`, push the Value on `vals`
+--   {k:"lit",   x}              -- push handl value `x` on `vals` (object keys)
+--   {k:"mkarr", d}              -- pop `d` values, push them as a list
+--   {k:"mkobj", d}              -- pop `2*d` values (k,v interleaved), push a record
+-- `vals` is a stack (head = most recent); container jobs sit *below*
+-- their children on `jobs`, so children complete before the container
+-- materialises.
+
+--- struct lh_entry { k@0, pad, v@16, next@24 } -- json-c's object
+--- linked list. `ffi.read` decodes the three pointer fields at once.
+ent_read := (e) ~> ffi.read(e, "rec:{k:ptr@0,v:ptr@16,next:ptr@24}")
+
+--- json_type enum (json_types.h): null=0 boolean=1 double=2 int=3
+--- object=4 array=5 string=6.
+
+--- Ordered [{k, v}] pairs of a json-c object, via lh_table.head@8 and
+--- lh_entry.next@24. `k` is a `char *` read back as a String.
+obj_ents := (o) ~> do {
+  tbl := c_obj_tbl(o)
+  if tbl == 0 {
+    []
+  } else {
+    while { e: ffi.read(tbl + 8, "ptr"), acc: [] } {
+      (e, acc) ~> if e == 0 {
+        { out: l_rev(acc) }
+      } else {
+        do {
+          ent := ent_read(e)
+          key := ffi.read(ent.k, "cstr")
+          { state: { e: ent.next, acc: [{ k: key, v: ent.v }, ...acc] } }
+        }
+      }
+    }
+  }
+}
+
+--- Child `json_object *` pointers of a json-c array, in order.
+arr_kids := (o) ~> do {
+  n := c_arr_len(o)
+  while { i: 0, acc: [] } {
+    (i, acc) ~> if i >= n {
+      { out: acc }
+    } else {
+      { state: { i: i + 1, acc: [...acc, c_arr_get(o, i)] } }
+    }
+  }
+}
+
+--- `xs` must be the REVERSED child list: prepending yields head-first
+--- processing order (stack LIFO).
+go_seg := (xs, acc) ~> while { xs: xs, acc: acc } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [h, ...t]: { state: { xs: t, acc: [{ k: "go", o: h, x: null, d: 0, key: null }, ...acc] } }
+  }
+}
+
+--- Same reversal trick for object entries: each entry contributes a
+--- `lit` (key string) then a `go` (value object), key first.
+ent_seg := (xs, acc) ~> while { xs: xs, acc: acc } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [h, ...t]: {
+      state: {
+        xs: t,
+        acc: [
+          { k: "lit", o: 0, x: h.k, d: 0, key: null },
+          { k: "go", o: h.v, x: null, d: 0, key: null },
+          ...acc
+        ]
+      }
+    }
+  }
+}
+
+--- Pop `n` values off `vs` into `{items, rest}`; `items` preserves
+--- list order (each pop prepends).
+popn := (vs, n) ~> while { vs: vs, acc: [], i: 0 } {
+  (vs, acc, i) ~> if i >= n {
+    { out: { items: acc, rest: vs } }
+  } else {
+    match vs {
+      [h, ...t]: { state: { vs: t, acc: [h, ...acc], i: i + 1 } },
+      []: { out: { items: acc, rest: [] } }
+    }
+  }
+}
+
+--- `[k, v, k, v, ...]` -> `[[k, v], ...]` for `obj.from_entries`.
+pairs_of := (xs) ~> while { xs: xs, acc: [] } {
+  (xs, acc) ~> match xs {
+    []: { out: l_rev(acc) },
+    [k, v, ...t]: { state: { xs: t, acc: [[k, v], ...acc] } },
+    _: { out: l_rev(acc) }
+  }
+}
+
+--- One `go` job: scalar -> push the converted Value; container -> push
+--- the materialising job below freshly queued child jobs.
+go_job := (jb, jrest, vals) ~> do {
+  t := c_type(jb.o)
+  if t == 0 || t == 1 || t == 2 || t == 3 || t == 6 {
+    hv := if t == 0 {
+      null
+    } else {
+      if t == 1 {
+        c_get_bool(jb.o) != 0
+      } else {
+        if t == 2 {
+          c_get_dbl(jb.o)
+        } else {
+          if t == 3 {
+            c_get_int(jb.o)
+          } else {
+            c_get_str(jb.o)
+          }
+        }
+      }
+    }
+    { state: { jobs: jrest, vals: [hv, ...vals] } }
+  } else {
+    if t == 5 {
+      do {
+        kids := arr_kids(jb.o)
+        seg := go_seg(l_rev(kids), [])
+        njobs := [...seg, { k: "mkarr", o: 0, x: null, d: list_len(kids), key: null }, ...jrest]
+        { state: { jobs: njobs, vals: vals } }
+      }
+    } else {
+      if t == 4 {
+        do {
+          ents := obj_ents(jb.o)
+          seg := ent_seg(l_rev(ents), [])
+          njobs := [...seg, { k: "mkobj", o: 0, x: null, d: list_len(ents), key: null }, ...jrest]
+          { state: { jobs: njobs, vals: vals } }
+        }
+      } else {
+        error.raise("json-c: unexpected json_type " + type.to_string(t))
+      }
+    }
+  }
+}
+
+parse_job := (jb, jrest, vals) ~> do {
+  if jb.k == "lit" {
+    { state: { jobs: jrest, vals: [jb.x, ...vals] } }
+  } else {
+    if jb.k == "mkarr" {
+      do {
+        r := popn(vals, jb.d)
+        { state: { jobs: jrest, vals: [r.items, ...r.rest] } }
+      }
+    } else {
+      if jb.k == "mkobj" {
+        do {
+          r := popn(vals, jb.d * 2)
+          obj_v := obj.from_entries(pairs_of(r.items))
+          { state: { jobs: jrest, vals: [obj_v, ...r.rest] } }
+        }
+      } else {
+        go_job(jb, jrest, vals)
+      }
+    }
+  }
+}
+
+parse_c := (s) ~> do {
+  -- Append one space: in STRICT mode a value that ends exactly at EOF
+  -- (a bare `null`/`true`/`false`/number literal) reports
+  -- json_tokener_continue, because the tokener cannot yet rule out a
+  -- longer token. A trailing space terminates the literal; it is
+  -- insignificant whitespace, never part of the value.
+  b := bytes.concat(bytes.utf8_encode(s), bytes.from_list([32]))
+  n := bytes.len(b)
+  tok := c_tok_new()
+  if tok == 0 {
+    error.raise("json-c: tokener alloc failed")
+  } else {
+    do {
+      _fl := c_tok_flags(tok, 1)
+      root := c_parse_ex(tok, b, n)
+      errc := c_tok_err(tok)
+      endp := c_tok_end(tok)
+      _fr := c_tok_free(tok)
+      if errc != 0 || endp != n {
+        error.raise("json-c: parse error")
+      } else {
+        do {
+          -- root == 0 with err == 0 is a top-level JSON `null`
+          -- (json-c represents null as the NULL pointer).
+          if root == 0 {
+            null
+          } else {
+            do {
+              r := while { jobs: [{ k: "go", o: root, x: null, d: 0, key: null }], vals: [] } {
+                (jobs, vals) ~> match jobs {
+                  []: { out: at(vals, 0) },
+                  [jb, ...jrest]: parse_job(jb, jrest, vals)
+                }
+              }
+              _p := c_put(root)
+              r
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+-- stringify: handl Value -> json_object tree -> text -------------------------------
+--
+-- Same uniform job shape {k:"v", x, d, o, key}: `d` is the delivery
+-- kind -- 0 root, 1 array-append into `o`, 2 object-add under `key`
+-- into `o`. A container job attaches its (still empty) C object to
+-- its parent immediately -- `object_add`/`array_add` steal the
+-- reference, and later child adds mutate the same object -- then
+-- queues its children reversed so they process in order.
+
+deliver := (pv, d, o, key, root) ~> do {
+  if d == 0 {
+    pv
+  } else {
+    if d == 1 {
+      _a := c_arr_add(o, pv)
+    } else {
+      _b := c_obj_add(o, key, pv)
+    }
+    root
+  }
+}
+
+--- Children jobs for a container value `x` whose C object is `c`.
+--- `kind` is 1 (array, `x` is the element list) or 2 (object,
+--- `obj.entries(x)` pairs).
+child_jobs := (x, c, kind) ~> do {
+  if kind == 1 {
+    xs := x
+    while { xs: l_rev(xs), acc: [] } {
+      (xs, acc) ~> match xs {
+        []: { out: acc },
+        [h, ...t]: { state: { xs: t, acc: [{ k: "v", x: h, d: 1, o: c, key: null }, ...acc] } }
+      }
+    }
+  } else {
+    es := obj.entries(x)
+    while { xs: l_rev(es), acc: [] } {
+      (xs, acc) ~> match xs {
+        []: { out: acc },
+        [h, ...t]: {
+          state: {
+            xs: t,
+            acc: [{ k: "v", x: p_at(h, 1), d: 2, o: c, key: p_at(h, 0) }, ...acc]
+          }
+        }
+      }
+    }
+  }
+}
+
+--- Scalar -> fresh `json_object *`; containers handled by the caller.
+scalar_obj := (x) ~> do {
+  if x == null {
+    0
+  } else {
+    if typeof.is(x, typeof.str()) {
+      c_new_str(x)
+    } else {
+      if typeof.is(x, typeof.bool()) {
+        c_new_bool(if x { 1 } else { 0 })
+      } else {
+        if typeof.is(x, typeof.num()) {
+          if math.is_integer(x) && math.abs(x) < 9007199254740992 {
+            c_new_int(x)
+          } else {
+            c_new_dbl(x)
+          }
+        } else {
+          0
+        }
+      }
+    }
+  }
+}
+
+step_v := (jb, jrest, root) ~> do {
+  x := jb.x
+  if x == null || typeof.is(x, typeof.str()) || typeof.is(x, typeof.bool()) || typeof.is(x, typeof.num()) {
+    pv := scalar_obj(x)
+    { state: { jobs: jrest, root: deliver(pv, jb.d, jb.o, jb.key, root) } }
+  } else {
+    if typeof.is(x, typeof.arr()) {
+      do {
+        c := c_new_arr()
+        nr := deliver(c, jb.d, jb.o, jb.key, root)
+        seg := child_jobs(x, c, 1)
+        { state: { jobs: [...seg, ...jrest], root: nr } }
+      }
+    } else {
+      do {
+        c := c_new_obj()
+        nr := deliver(c, jb.d, jb.o, jb.key, root)
+        seg := child_jobs(x, c, 2)
+        { state: { jobs: [...seg, ...jrest], root: nr } }
+      }
+    }
+  }
+}
+
+stringify_c := (v) ~> do {
+  r := while { jobs: [{ k: "v", x: v, d: 0, o: 0, key: null }], root: 0 } {
+    (jobs, root) ~> match jobs {
+      []: do {
+        s := c_to_json(root)
+        _p := c_put(root)
+        { out: if s == null { error.raise("json-c: stringify failed") } else { s } }
+      },
+      [jb, ...jrest]: step_v(jb, jrest, root)
+    }
+  }
+  r
+}
+
+-- contract surface -----------------------------------------------------------------
+
+--- Whether `libjson-c` was found (false -> pure-handl `json` fallback).
+export jsonc_available := jlib != null
+
+--- The detected json-c version number (0 when unavailable).
+export jsonc_version := jc_ver
+
+--- Serialize a Value to JSON text -- json-c `JSON_C_TO_STRING_PLAIN`,
+--- or the `json` reference when the library is absent.
+export stringify := (v) ~> if jlib == null {
+  jref.stringify(v)
+} else {
+  stringify_c(v)
+}
+
+--- Parse JSON text into a Value -- strict via `json_tokener_parse`
+--- (raises on malformed input), or the lenient `json` reference when
+--- the library is absent.
+export parse := (s) ~> if jlib == null {
+  jref.parse(s)
+} else {
+  parse_c(s)
+}
+
+export json := () ~> ({ "type": "codec", "name": "json", "encode": stringify, "decode": parse })
